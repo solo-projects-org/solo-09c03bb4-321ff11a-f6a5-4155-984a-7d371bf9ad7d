@@ -11,6 +11,10 @@ from pathlib import Path
 
 DATA_VOLUME = Path(os.environ.get("DATA_VOLUME", "/data")).resolve()
 
+# Demo-only fault injection. Off unless explicitly enabled; the production
+# container image and docker-compose do not set this.
+DEMO_FAULT_ENABLED = os.environ.get("DEMO_FAULT", "0") == "1"
+
 DB_PATH = DATA_VOLUME / "state.db"
 INBOX_DIR = DATA_VOLUME / "inbox"        # validated raw CSV uploads, kept for audit
 DAILY_DIR = DATA_VOLUME / "daily"        # <station>/daily-<day>-v<id>.parquet

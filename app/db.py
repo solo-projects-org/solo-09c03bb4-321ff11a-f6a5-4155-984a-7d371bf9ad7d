@@ -36,9 +36,15 @@ CREATE TABLE IF NOT EXISTS daily_versions (
     csv_path    TEXT NOT NULL,
     parquet_path TEXT,
     row_count   INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL CHECK (status IN ('building','ready','failed')),
+    status      TEXT NOT NULL CHECK (status IN
+                    ('building','ready','failed','obsolete')),
     error       TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    -- 1 only after the raw CSV has been durably saved AND the row registered.
+    -- Version ordering ("最新更正") is defined over rows with csv_saved=1;
+    -- a save failure deletes the row instead, so it never takes a version id
+    -- away from a later, successful upload.
+    csv_saved   INTEGER NOT NULL DEFAULT 0,
     is_current  INTEGER NOT NULL DEFAULT 0,
     superseded_at TEXT
 );
@@ -101,6 +107,54 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an older state.db up to the current schema (additive migrations)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(daily_versions)")}
+    if "csv_saved" not in cols:
+        conn.execute(
+            "ALTER TABLE daily_versions ADD COLUMN csv_saved INTEGER NOT NULL DEFAULT 0"
+        )
+        # Rows in an old database only existed after a successful CSV save.
+        conn.execute("UPDATE daily_versions SET csv_saved=1 WHERE csv_path<>''")
+
+    # The CHECK constraint gained the 'obsolete' daily status. SQLite cannot
+    # alter a check in place, so rebuild the table once when needed.
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_versions'"
+    ).fetchone()["sql"]
+    if "'obsolete'" not in ddl:
+        conn.executescript(
+            """
+            ALTER TABLE daily_versions RENAME TO daily_versions_old;
+            CREATE TABLE daily_versions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                station     TEXT NOT NULL,
+                day         TEXT NOT NULL,
+                csv_path    TEXT NOT NULL,
+                parquet_path TEXT,
+                row_count   INTEGER NOT NULL DEFAULT 0,
+                status      TEXT NOT NULL CHECK (status IN
+                                ('building','ready','failed','obsolete')),
+                error       TEXT,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                csv_saved   INTEGER NOT NULL DEFAULT 0,
+                is_current  INTEGER NOT NULL DEFAULT 0,
+                superseded_at TEXT
+            );
+            INSERT INTO daily_versions
+                (id, station, day, csv_path, parquet_path, row_count, status,
+                 error, created_at, csv_saved, is_current, superseded_at)
+            SELECT id, station, day, csv_path, parquet_path, row_count, status,
+                   error, created_at, csv_saved, is_current, superseded_at
+            FROM daily_versions_old;
+            DROP TABLE daily_versions_old;
+            CREATE INDEX IF NOT EXISTS idx_daily_lookup
+                ON daily_versions(station, day, is_current);
+            """
+        )
 
 
 @contextmanager

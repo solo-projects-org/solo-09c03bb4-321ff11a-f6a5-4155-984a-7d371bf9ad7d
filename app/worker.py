@@ -29,9 +29,40 @@ from . import config, db, fsutil, parquet
 _wakeup = threading.Event()
 _worker_started = False
 
+# Demo/test only: when enabled (DEMO_FAULT=1), the next daily transcription
+# raises a simulated I/O error once, so the UI can show 失败/待补算 and retry.
+# Disabled by default; nothing in the normal deployment sets this flag.
+_fault_next_daily = False
+
+
+def arm_daily_fault() -> bool:
+    """Arm a one-shot daily-build failure. Returns False when disabled."""
+    global _fault_next_daily
+    if not config.DEMO_FAULT_ENABLED:
+        return False
+    _fault_next_daily = True
+    return True
+
 
 def wakeup() -> None:
     _wakeup.set()
+
+
+# --------------------------------------------------------------------------- #
+# Version rule helpers
+# --------------------------------------------------------------------------- #
+def latest_saved_daily_id(conn: sqlite3.Connection, station: str, day: str) -> int | None:
+    """Newest accepted (CSV saved + registered) version for one station-day.
+
+    This id defines "最新更正". Rows whose save failed are deleted at upload
+    time and therefore never participate in the ordering.
+    """
+    row = conn.execute(
+        "SELECT MAX(id) AS id FROM daily_versions "
+        "WHERE station=? AND day=? AND csv_saved=1",
+        (station, day),
+    ).fetchone()
+    return row["id"]
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +91,36 @@ def enqueue_monthly_build(conn: sqlite3.Connection, station: str, month: str) ->
     return gen_id
 
 
+def ensure_daily_job_pending(conn: sqlite3.Connection, daily_id: int) -> None:
+    """Make sure a saved daily version has a queued build job.
+
+    Used by startup recovery: a crash between the version registration and the
+    job enqueue must not strand an accepted correction forever.
+    """
+    row = conn.execute(
+        "SELECT id FROM jobs WHERE kind='daily_build' AND ref_id=? "
+        "AND status IN ('pending','running')",
+        (daily_id,),
+    ).fetchone()
+    if row is None:
+        existing = conn.execute(
+            "SELECT id, status FROM jobs WHERE kind='daily_build' AND ref_id=?",
+            (daily_id,),
+        ).fetchone()
+        if existing is not None and existing["status"] == "failed":
+            conn.execute(
+                "UPDATE jobs SET status='pending', error=NULL, "
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                (existing["id"],),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO jobs(kind, ref_id, status) "
+                "VALUES ('daily_build', ?, 'pending')",
+                (daily_id,),
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Startup recovery
 # --------------------------------------------------------------------------- #
@@ -82,9 +143,12 @@ def recover() -> dict[str, object]:
                 )
                 report["reset_jobs"].append(row["id"])
 
-            # 2. Daily rows left in 'building' after a crash: the parquet was
-            #    never registered, so the attempt becomes a retryable failure
-            #    and any half-published file is removed.
+            # 2. Daily rows left in 'building' after a crash. The parquet was
+            #    never registered, so remove any half-published file. If the
+            #    version is still the newest accepted upload it is auto-resumed
+            #    (its job is already back to 'pending' from step 1); a version
+            #    superseded by a newer correction can never be current again and
+            #    is retired as obsolete together with its job.
             for row in conn.execute(
                 "SELECT id, station, day, parquet_path FROM daily_versions "
                 "WHERE status='building'"
@@ -98,16 +162,52 @@ def recover() -> dict[str, object]:
                         report["orphans_removed"].append(str(stale_file))
                     except OSError:
                         pass
-                conn.execute(
-                    "UPDATE daily_versions SET status='failed', parquet_path=NULL, "
-                    "error='进程在转写过程中退出，可重试' WHERE id=?",
-                    (row["id"],),
-                )
-                conn.execute(
-                    "UPDATE jobs SET status='failed', error='进程中途退出' "
-                    "WHERE kind='daily_build' AND ref_id=? AND status IN ('pending','running')",
-                    (row["id"],),
-                )
+                newest_id = latest_saved_daily_id(conn, row["station"], row["day"])
+                if newest_id == row["id"]:
+                    # Auto-resume: keep status='building'; the pending/running
+                    # daily_build job (reset in step 1) will pick it up.
+                    ensure_daily_job_pending(conn, row["id"])
+                else:
+                    conn.execute(
+                        "UPDATE daily_versions SET status='obsolete', parquet_path=NULL, "
+                        "error='进程退出前已被更新的更正取代，不再续算' WHERE id=?",
+                        (row["id"],),
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET status='obsolete', "
+                        "error='旧版本作业，已被更新的更正取代' "
+                        "WHERE kind='daily_build' AND ref_id=? AND status IN "
+                        "('pending','running','failed')",
+                        (row["id"],),
+                    )
+
+            # 2b. Already-failed daily jobs that were the newest version must
+            #     be auto-resumed after restart as well (the task was saved but
+            #     its transcription never finished). Older failed versions are
+            #     retired instead.
+            for row in conn.execute(
+                "SELECT id, station, day FROM daily_versions WHERE status='failed'"
+            ).fetchall():
+                newest_id = latest_saved_daily_id(conn, row["station"], row["day"])
+                if newest_id == row["id"]:
+                    conn.execute(
+                        "UPDATE daily_versions SET status='building', error=NULL WHERE id=?",
+                        (row["id"],),
+                    )
+                    ensure_daily_job_pending(conn, row["id"])
+                else:
+                    conn.execute(
+                        "UPDATE daily_versions SET status='obsolete', "
+                        "error='已被更新的更正取代' WHERE id=? AND status='failed'",
+                        (row["id"],),
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET status='obsolete', "
+                        "error='旧版本作业，已被更新的更正取代' "
+                        "WHERE kind='daily_build' AND ref_id=? AND status IN "
+                        "('pending','running','failed')",
+                        (row["id"],),
+                    )
 
             # 3. Monthly generations left in 'building': keep them as pending
             #    work (their job was reset above); remove any orphaned file.
@@ -234,6 +334,26 @@ def _run_daily_build(conn: sqlite3.Connection, job_id: int, daily_id: int) -> No
     if row is None:
         raise RuntimeError(f"日档记录 {daily_id} 不存在")
 
+    # Version gate (rule: newest accepted upload wins). If a newer correction
+    # was already accepted, this late/retried/restarted job can never become
+    # the current day file again — regardless of whether its build succeeds.
+    newest_id = latest_saved_daily_id(conn, row["station"], row["day"])
+    if newest_id is not None and newest_id != daily_id:
+        with db.tx(conn):
+            conn.execute(
+                "UPDATE daily_versions SET status='obsolete', is_current=0, "
+                "error='已被更新的更正取代，本作业迟到完成，不得成为当前日档' "
+                "WHERE id=? AND status IN ('building','failed')",
+                (daily_id,),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='obsolete', error='旧版本作业，已被更新的更正取代', "
+                "attempts=attempts+1, "
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                (job_id,),
+            )
+        return
+
     csv_path = Path(row["csv_path"])
     if not csv_path.is_file():
         raise RuntimeError(f"原始 CSV 已丢失: {csv_path}")
@@ -247,6 +367,9 @@ def _run_daily_build(conn: sqlite3.Connection, job_id: int, daily_id: int) -> No
     final_path = config.daily_parquet_path(parsed.station, parsed.day, daily_id)
     tmp_path = fsutil.tmp_target(final_path, f"daily{daily_id}")
     fsutil.discard_tmp(tmp_path)
+    if _fault_next_daily:  # demo-only one-shot simulated write failure
+        globals()["_fault_next_daily"] = False
+        raise OSError("模拟转写故障（演示用，DEMO_FAULT 已开启）")
     written = parquet.write_daily_parquet(parsed.rows, tmp_path)
     parquet.verify_daily_parquet(tmp_path, parsed.row_count)
     fsutil.atomic_publish(tmp_path, final_path)
@@ -256,6 +379,21 @@ def _run_daily_build(conn: sqlite3.Connection, job_id: int, daily_id: int) -> No
     # remains harmless (orphan-cleanup keeps files owned by registered rows).
 
     with db.tx(conn):
+        # Re-check inside the write lock: a correction accepted while the
+        # parquet was being written would make this version non-current.
+        if latest_saved_daily_id(conn, parsed.station, parsed.day) != daily_id:
+            conn.execute(
+                "UPDATE daily_versions SET status='obsolete', is_current=0, "
+                "error='发布前已被更新的更正取代' WHERE id=? AND status='building'",
+                (daily_id,),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='obsolete', error='发布前已被更新的更正取代', "
+                "attempts=attempts+1, "
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                (job_id,),
+            )
+            return
         conn.execute(
             "UPDATE daily_versions SET parquet_path=?, row_count=?, status='ready', "
             "error=NULL, is_current=1 WHERE id=?",
@@ -282,6 +420,8 @@ def _run_daily_build(conn: sqlite3.Connection, job_id: int, daily_id: int) -> No
             "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
             (job_id,),
         )
+    # A daily build finishing may unblock a monthly job parked in _WaitForDaily.
+    wakeup()
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +432,28 @@ def _current_daily_deps(conn: sqlite3.Connection, station: str, month: str):
         "SELECT id, day, parquet_path, row_count FROM daily_versions "
         "WHERE station=? AND substr(day,1,7)=? AND is_current=1 AND status='ready' "
         "ORDER BY day",
+        (station, month),
+    ).fetchall()
+
+
+class _WaitForDaily(Exception):
+    """Raised when the newest accepted day files are not all built yet.
+
+    The job stays ``pending`` (shown as 补算中) and is retried automatically;
+    nothing is marked failed and no monthly file is published in the meantime.
+    """
+
+
+def _latest_saved_dailies(conn: sqlite3.Connection, station: str, month: str):
+    """One row per station-day: its newest *accepted* (csv_saved) version."""
+    return conn.execute(
+        "SELECT d.id, d.day, d.status, d.is_current, d.parquet_path, "
+        "       (SELECT COUNT(*) FROM jobs j WHERE j.kind='daily_build' "
+        "          AND j.ref_id=d.id AND j.status IN ('pending','running')) AS has_active_job "
+        "FROM daily_versions d "
+        "JOIN (SELECT day, MAX(id) AS id FROM daily_versions "
+        "      WHERE station=? AND substr(day,1,7)=? AND csv_saved=1 GROUP BY day) m "
+        "  ON m.id = d.id ORDER BY d.day",
         (station, month),
     ).fetchall()
 
@@ -343,18 +505,28 @@ def _run_monthly_build(conn: sqlite3.Connection, job_id: int, gen_id: int) -> No
         _obsolete_monthly(conn, job_id, gen_id, "排队期间日档再次变更，由更新的作业接算")
         return
 
-    # All current daily files of the month must be fully built first.
-    pending_daily = conn.execute(
-        "SELECT COUNT(*) AS c FROM jobs j JOIN daily_versions d ON d.id=j.ref_id "
-        "WHERE j.kind='daily_build' AND j.status IN ('pending','running') "
-        "AND d.station=? AND substr(d.day,1,7)=?",
-        (station, month),
-    ).fetchone()["c"]
+    # A monthly file may be published only when EVERY newest accepted daily
+    # version of the station-month is fully built and current. If the newest
+    # version is still being transcribed, keep waiting (never publish old
+    # content as latest); if it has failed, fail this job with a clear reason.
+    latest_days = _latest_saved_dailies(conn, station, month)
+    if not latest_days:
+        raise RuntimeError("本月没有任何已接收日档，无法合并月文件")
+    not_ready = [
+        r for r in latest_days
+        if not (r["status"] == "ready" and r["is_current"] == 1)
+    ]
+    if not_ready:
+        if any(r["has_active_job"] or r["status"] == "building" for r in not_ready):
+            raise _WaitForDaily(
+                "最新更正日档尚未补算完成，月文件等待日档就绪（旧完整文件仍可下载）"
+            )
+        raise RuntimeError(
+            "最新更正日档转写失败，月文件不能以旧内容冒充最新；请先重试该日档作业"
+        )
     deps = _current_daily_deps(conn, station, month)
-    if pending_daily or not deps or any(
-        not Path(r["parquet_path"]).is_file() for r in deps
-    ):
-        raise RuntimeError("本月仍有日档未转写完成，月文件等待日档就绪")
+    if any(not Path(r["parquet_path"]).is_file() for r in deps):
+        raise _WaitForDaily("日档文件尚未落盘完成，月文件等待日档就绪")
 
     signature, dep_list = _month_signature(conn, station, month)
     daily_paths = [r["parquet_path"] for r in dep_list]
@@ -458,6 +630,17 @@ def _process_one(conn: sqlite3.Connection) -> bool:
             _run_daily_build(conn, job["id"], job["ref_id"])
         else:
             _run_monthly_build(conn, job["id"], job["ref_id"])
+    except _WaitForDaily:
+        # Not a failure: the newest daily correction is still building. Return
+        # the job to the queue; the dashboard keeps showing 补算中 and the
+        # previous complete monthly file stays downloadable.
+        with db.tx(conn):
+            conn.execute(
+                "UPDATE jobs SET status='pending', "
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                (job["id"],),
+            )
+        return False  # let the worker loop pause before re-picking
     except Exception as exc:  # recorded as retryable failure, worker survives
         # The worker runs one task at a time, so every staging file left by
         # this attempt is safe to remove; the registered final paths are never

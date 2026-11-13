@@ -50,7 +50,7 @@ class Server:
     def start(self) -> None:
         env = os.environ.copy()
         env["DATA_VOLUME"] = str(self.volume)
-        env["PYTHONPATH"] = str(ROOT)
+        env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         env.update(self.env_extra)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app",

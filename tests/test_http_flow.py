@@ -211,3 +211,174 @@ def test_dashboard_renders(server):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "ST001" in resp.text and "下载最新月文件" in resp.text
+
+
+def test_save_failure_changes_nothing_and_keeps_version_order(server, volume, monkeypatch):
+    """CSV 落盘失败：删除预登记行，原日档不动，后续成功上传仍是连续版本。"""
+    # A normal first upload establishes v1.
+    upload(client := server.client(), make_csv("ST001", "2026-11-10", {h: 10 for h in range(24)}))
+    wait_for(client, ("ST001", "2026-11"))
+    data = client.get("/api/status").json()
+    day = [d for d in data["days"] if d["station"] == "ST001"][0]
+    v1 = day["head_id"]
+    assert day["is_latest"] is True
+
+    # Make the atomic CSV publish fail inside the live server process by
+    # pointing DATA_VOLUME at a read-only location via an env-driven fault:
+    # here we remove write permission on the inbox directory instead.
+    inbox = volume / "inbox"
+    inbox.chmod(0o500)
+    try:
+        r = upload(client, make_csv("ST001", "2026-11-10", {h: 33 for h in range(24)}))
+        assert r.status_code == 303
+        assert "保存失败" in redirect_message(r)
+    finally:
+        inbox.chmod(0o700)
+
+    # State is unchanged: still one version, still current, no failed row.
+    data = client.get("/api/status").json()
+    days = [d for d in data["days"] if d["station"] == "ST001"]
+    assert len(days) == 1
+    assert days[0]["head_id"] == v1 and days[0]["is_latest"] is True
+    assert days[0]["badge"][0] == "最新"
+
+    # The next successful upload becomes the new head (autoincrement ids are
+    # not recycled after a deleted row — what matters is that the failed save
+    # changed no existing state) and converges normally.
+    r = upload(client, make_csv("ST001", "2026-11-10", {h: 44 for h in range(24)}))
+    assert r.status_code == 303
+    wait_for(client, ("ST001", "2026-11"), after_gen=data["months"][0]["download_id"])
+    data = client.get("/api/status").json()
+    day = [d for d in data["days"] if d["station"] == "ST001"][0]
+    assert day["head_id"] > v1 and day["is_latest"] is True
+    assert day["version_count"] == 2  # only the two successful uploads
+
+
+def test_retrying_old_failed_daily_job_is_rejected(server, volume):
+    """新更正已接收后，旧失败作业的重试被拒并作废，绝不回滚当前日档。"""
+    client = server.client()
+    # v1 published.
+    upload(client, make_csv("ST001", "2026-11-10", {h: 10 for h in range(24)}))
+    wait_for(client, ("ST001", "2026-11"))
+    data = client.get("/api/status").json()
+    v1 = [d for d in data["days"] if d["station"] == "ST001"][0]["head_id"]
+
+    # v2 fails at CSV save (read-only inbox): no state change, no version row.
+    inbox = volume / "inbox"
+    inbox.chmod(0o500)
+    try:
+        r = upload(client, make_csv("ST001", "2026-11-10", {h: 11 for h in range(24)}))
+        assert r.status_code == 303 and "保存失败" in redirect_message(r)
+    finally:
+        inbox.chmod(0o700)
+
+    # v3 accepted and published: it is the newest correction.
+    upload(client, make_csv("ST001", "2026-11-10", {h: 12 for h in range(24)}))
+    wait_for(client, ("ST001", "2026-11"), after_gen=data["months"][0]["download_id"])
+    data = client.get("/api/status").json()
+    head = [d for d in data["days"] if d["station"] == "ST001"][0]
+    assert head["head_id"] > v1 and head["is_latest"] is True
+
+    # Now force a failed-but-superseded daily job through the real retry guard:
+    # upload v4, then make its *transcription* fail by blocking the parquet
+    # write is not possible over HTTP, so instead verify the guard on a job
+    # belonging to an older version. v1's original job is 'done' and retrying a
+    # non-failed job is refused; the important ordering invariant is that no
+    # operation can make v1 current again.
+    jobs = client.get("/api/status").json()["jobs"]
+    v1_job = next(j for j in jobs if j["kind"] == "daily_build"
+                  and j["status"] == "done" and j["ref_id"] == v1)
+    r = client.post(f"/jobs/{v1_job['id']}/retry", follow_redirects=False)
+    assert r.status_code == 303
+    assert "仅失败作业可重试" in redirect_message(r)
+
+    after = client.get("/api/status").json()
+    head_after = [d for d in after["days"] if d["station"] == "ST001"][0]
+    assert head_after["head_id"] > v1 and head_after["is_latest"] is True
+    # The current monthly stays published and downloadable.
+    assert client.get("/download/monthly/ST001/2026-11").status_code == 200
+
+
+def test_stale_failed_daily_retry_rejected_over_http(server, volume):
+    """旧版本的失败作业走真实重试接口时被拒并作废，当前日档不回滚。"""
+    import sqlite3
+
+    client = server.client()
+    upload(client, make_csv("ST001", "2026-11-10", {h: 10 for h in range(24)}))
+    wait_for(client, ("ST001", "2026-11"))
+    data = client.get("/api/status").json()
+    v1 = [d for d in data["days"] if d["station"] == "ST001"][0]["head_id"]
+
+    # A newer accepted + published correction becomes the current day file.
+    upload(client, make_csv("ST001", "2026-11-10", {h: 12 for h in range(24)}))
+    wait_for(client, ("ST001", "2026-11"), after_gen=data["months"][0]["download_id"])
+    data = client.get("/api/status").json()
+    v2 = [d for d in data["days"] if d["station"] == "ST001"][0]["head_id"]
+    assert v2 > v1
+
+    # Simulate an old (v1) failed job left behind, then retry it over HTTP.
+    db_path = volume / "state.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO jobs(kind, ref_id, status, error) "
+        "VALUES ('daily_build', ?, 'failed', 'old failure')", (v1,))
+    stale_job = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    r = client.post(f"/jobs/{stale_job}/retry", follow_redirects=False)
+    assert r.status_code == 303
+    assert "旧版本" in redirect_message(r)
+
+    # The stale job is obsoleted; v2 remains the sole current day file and the
+    # old v1 keeps its ready (historical, downloadable) row without reviving.
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT status FROM jobs WHERE id=?", (stale_job,)
+                        ).fetchone()["status"] == "obsolete"
+    assert conn.execute("SELECT is_current FROM daily_versions WHERE id=?", (v2,)
+                        ).fetchone()["is_current"] == 1
+    assert conn.execute("SELECT is_current FROM daily_versions WHERE id=?", (v1,)
+                        ).fetchone()["is_current"] == 0
+    conn.close()
+
+    after = client.get("/api/status").json()
+    head = [d for d in after["days"] if d["station"] == "ST001"][0]
+    assert head["head_id"] == v2 and head["is_latest"] is True
+
+
+def test_continuous_corrections_always_serve_newest(server, volume):
+    """连续多次更正：当前日档/月文件始终对应最新已接收且补算完成的版本。"""
+    client = server.client()
+    last_gen = 0
+    head_id = None
+    for round_, pm in enumerate((10, 20, 30, 40), start=1):
+        upload(client, make_csv("ST001", "2026-11-10", {h: pm for h in range(24)}))
+        data = wait_for(client, ("ST001", "2026-11"), after_gen=last_gen)
+        month = [m for m in data["months"] if m["station"] == "ST001"][0]
+        assert month["is_latest"] is True
+        assert month["badge"][0] == "最新"
+        last_gen = month["download_id"]
+        day = [d for d in data["days"] if d["station"] == "ST001"][0]
+        assert day["is_latest"] is True and day["badge"][0] == "最新"
+        head_id = day["head_id"]
+
+    # Four successful uploads -> four versions, the head is the last one.
+    data = client.get("/api/status").json()
+    day = [d for d in data["days"] if d["station"] == "ST001"][0]
+    assert day["version_count"] == 4 and day["head_id"] == head_id
+    # The newest monthly's dependency points exactly at the newest day version.
+    resp = client.get("/download/monthly/ST001/2026-11")
+    assert resp.status_code == 200
+    con = duckdb.connect()
+    try:
+        total = con.execute(
+            "SELECT sum(pm25) FROM read_parquet(?)",
+            [str(volume / "monthly" / "ST001" /
+                 f"monthly-2026-11-gen{last_gen}.parquet")]).fetchone()[0]
+    finally:
+        con.close()
+    assert total == 24 * 40  # the last correction's values
+    # All older generations remain downloadable history.
+    month = [m for m in data["months"] if m["station"] == "ST001"][0]
+    assert all(h["downloadable"] for h in month["history"])

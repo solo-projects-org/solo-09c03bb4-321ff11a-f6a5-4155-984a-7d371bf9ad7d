@@ -43,8 +43,10 @@
         <td>{{ m.day_count }}</td>
         <td>{{ m.row_count if m.row_count is not none else '—' }}</td>
         <td>
-          {% if m.download_ready %}
-            <span class="muted">gen{{ m.download_id }}</span>
+          {% if m.is_latest and m.download_ready %}
+            <span class="muted">gen{{ m.download_id }}（最新）</span>
+          {% elif m.download_ready %}
+            <span class="muted">gen{{ m.download_id }}（旧完整文件）</span>
           {% else %}
             <span class="muted">未发布</span>
           {% endif %}
@@ -53,7 +55,7 @@
           {% if m.error %}<div class="errtext">{{ m.error }}</div>{% endif %}
           {% if m.job %}
             <div class="muted">作业 #{{ m.job.id }}：
-              {% if m.job.status == 'pending' %}排队中（尝试 {{ m.job.attempts }} 次）
+              {% if m.job.status == 'pending' %}排队/等待日档中（尝试 {{ m.job.attempts }} 次）
               {% elif m.job.status == 'running' %}补算中…
               {% elif m.job.status == 'failed' %}失败（尝试 {{ m.job.attempts }} 次）
               {% endif %}
@@ -62,7 +64,11 @@
         </td>
         <td class="actions">
           {% if m.download_ready %}
+            {% if m.is_latest %}
             <a class="btn" href="/download/monthly/{{ m.station }}/{{ m.month }}">下载最新月文件</a>
+            {% else %}
+            <a class="btn stale-btn" href="/download/generation/{{ m.download_id }}">下载旧完整月文件</a>
+            {% endif %}
           {% else %}
             <button class="btn disabled" disabled>暂无可用文件</button>
           {% endif %}
@@ -124,13 +130,20 @@
         <td>{{ d.station }}</td>
         <td>{{ d.day }}</td>
         <td>{{ d.version_count }}</td>
-        <td>{% if d.current_id %}v{{ d.current_id }}{% else %}—{% endif %}</td>
+        <td>
+          最新接收 v{{ d.head_id }}
+          {% if d.current_id and d.current_id != d.head_id %}
+            <div class="muted">当前可用 v{{ d.current_id }}（旧完整文件）</div>
+          {% endif %}
+        </td>
         <td><span class="badge {{ d.badge[1] }}">{{ d.badge[0] }}</span></td>
         <td>{{ d.row_count if d.row_count is not none else '—' }}</td>
         <td class="reason">{% if d.error %}<span class="errtext">{{ d.error }}</span>{% endif %}</td>
         <td class="actions">
           {% if d.download_ready %}
-            <a class="btn small" href="/download/daily/{{ d.station }}/{{ d.day }}">下载当前日 Parquet</a>
+            <a class="btn small" href="/download/daily/{{ d.station }}/{{ d.day }}">下载最新日 Parquet</a>
+          {% elif d.fallback_ready %}
+            <a class="btn small stale-btn" href="/download/daily/version/{{ d.fallback_id }}">下载旧完整日档</a>
           {% else %}
             <button class="btn disabled small" disabled>不可下载</button>
           {% endif %}

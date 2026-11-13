@@ -58,6 +58,7 @@ table.inner { margin: 8px 0; }
 }
 .btn.small { padding: 3px 8px; font-size: 12px; }
 .btn.warn { background: var(--busy-bg); color: var(--busy); border-color: #d4a72c; }
+.btn.stale-btn { background: var(--stale-bg); color: var(--stale); border-color: var(--border); }
 .btn.disabled { opacity: .55; cursor: not-allowed; }
 .inline { display: inline; margin-left: 6px; }
 .actions { white-space: nowrap; }

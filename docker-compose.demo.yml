@@ -1,0 +1,10 @@
+services:
+  air-station-monthly:
+    # Demo overlay: enable the one-shot fault endpoint so scripts/demo.py can
+    # show a transcription failure and its retry. Activate with:
+    #   docker compose --profile demo up --build
+    # The default `docker compose up` never sets DEMO_FAULT, so this endpoint
+    # answers 404 and the single-instance production behaviour is unchanged.
+    profiles: ["demo"]
+    environment:
+      DEMO_FAULT: "1"

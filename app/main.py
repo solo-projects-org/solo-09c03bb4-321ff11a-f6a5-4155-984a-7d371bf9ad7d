@@ -57,6 +57,20 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/demo/arm-fault")
+def demo_arm_fault():
+    """Demo-only: make the next daily transcription fail once.
+
+    Returns 404 unless the process was started with DEMO_FAULT=1, so the
+    endpoint cannot exist in a normal deployment.
+    """
+    if not config.DEMO_FAULT_ENABLED:
+        return JSONResponse({"enabled": False}, status_code=404)
+    armed = worker.arm_daily_fault()
+    worker.wakeup()
+    return JSONResponse({"enabled": True, "armed": armed})
+
+
 @app.get("/api/status")
 def api_status():
     return JSONResponse(status_mod.list_overview())
@@ -93,7 +107,8 @@ async def upload(file: UploadFile = File(...)):
         )
 
     # 2. Persist the raw CSV atomically. Failure here must leave the old day
-    #    fully untouched (nothing has been marked current yet).
+    #    fully untouched: the provisional row is deleted (no version id and no
+    #    job survives it), so the upload never changes any existing state.
     tmp_csv = fsutil.tmp_target(csv_final, f"upload{daily_id}")
     try:
         tmp_csv.write_bytes(raw)
@@ -101,17 +116,21 @@ async def upload(file: UploadFile = File(...)):
     except OSError as exc:
         with db.get_conn() as conn:
             conn.execute(
-                "UPDATE daily_versions SET status='failed', error=? WHERE id=?",
-                (f"CSV 落盘失败: {exc}", daily_id),
+                "DELETE FROM daily_versions WHERE id=? AND csv_saved=0",
+                (daily_id,),
             )
         fsutil.discard_tmp(tmp_csv)
         return RedirectResponse(
             f"/?err={_q('保存失败，原日档保留：' + str(exc))}", status_code=303
         )
 
-    # 3. Enqueue the durable build job (daily parquet -> monthly rebuild).
+    # 3. The CSV is durably saved: from this instant this upload is an accepted
+    #    correction and defines the newest version ordering for station/day.
     with db.get_conn() as conn:
         with db.tx(conn):
+            conn.execute(
+                "UPDATE daily_versions SET csv_saved=1 WHERE id=?", (daily_id,)
+            )
             worker.enqueue_daily_build(conn, daily_id)
     worker.wakeup()
 
@@ -139,6 +158,38 @@ def retry_job(job_id: int):
                 )
 
             if job["kind"] == "daily_build":
+                version = conn.execute(
+                    "SELECT station, day, status FROM daily_versions WHERE id=?",
+                    (job["ref_id"],),
+                ).fetchone()
+                if version is None:
+                    return RedirectResponse(
+                        f"/?err={_q('该作业对应的日档版本已不存在')}", status_code=303
+                    )
+                # Version rule: only the newest *successfully saved* upload may
+                # become the current day file. A newer correction already
+                # accepted means this job can never be current again.
+                newest = conn.execute(
+                    "SELECT MAX(id) AS id FROM daily_versions "
+                    "WHERE station=? AND day=? AND csv_saved=1",
+                    (version["station"], version["day"]),
+                ).fetchone()["id"]
+                if newest is not None and newest != job["ref_id"]:
+                    conn.execute(
+                        "UPDATE jobs SET status='obsolete', error='已被更新的更正取代', "
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                        (job_id,),
+                    )
+                    conn.execute(
+                        "UPDATE daily_versions SET status='obsolete', "
+                        "error='已被更新的更正取代，旧作业不得重试' "
+                        "WHERE id=? AND status IN ('failed','building')",
+                        (job["ref_id"],),
+                    )
+                    return RedirectResponse(
+                        f"/?err={_q('该失败作业属于旧版本，更新的更正已接收，无需重试')}",
+                        status_code=303,
+                    )
                 conn.execute(
                     "UPDATE daily_versions SET status='building', error=NULL "
                     "WHERE id=? AND status='failed'",
